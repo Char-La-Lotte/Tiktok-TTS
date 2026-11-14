@@ -162,8 +162,10 @@ class App(ctk.CTk):
         self.update_ui_state()
         self.update_admin_page()
         if hasattr(self, "log_box"):
-            self.log_box.configure(state="normal")
-            self.log_box.delete("1.0", "end")
+            if not getattr(self, "_last_connected_user", None) or self._last_connected_user != username:
+                self.log_box.configure(state="normal")
+                self.log_box.delete("1.0", "end")
+        self._last_connected_user = username
         self.add_log(f"✅ Đã kết nối tới @{username}")
 
     # ==============================

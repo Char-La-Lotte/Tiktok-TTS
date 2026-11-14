@@ -8,6 +8,8 @@ import re
 import hashlib
 import warnings
 import subprocess
+import collections
+import asyncio
 
 from gtts import gTTS
 import pygame
@@ -208,9 +210,16 @@ class TikTokManager:
         # =====================================================
         # 🧠 STATE
         # =====================================================
-        self.recent_comments = {}
+        self.seen_msg_ids = collections.OrderedDict()
+        self.recent_comments = collections.OrderedDict()
+        self.processed_gifts = {}
+        self.gift_buffer = {}
         self.like_buffer = {}
         self.like_last = {}
+        self.connection_time = 0.0
+        self.is_reconnecting = False
+        self.reconnect_timer = None
+        self._can_read_timer = None
 
         # =====================================================
         # 📁 AUDIO DIR
@@ -273,6 +282,11 @@ class TikTokManager:
             text, speed = item
 
             if self.is_stop:
+                self.tts_queue.task_done()
+                continue
+
+            # Bỏ qua nếu text rỗng hoặc không có chữ cái/số nào để đọc (tránh lỗi gTTS No text to speak)
+            if not text or not str(text).strip() or not re.search(r"[\w\dÀ-ỹ]", str(text)):
                 self.tts_queue.task_done()
                 continue
 
@@ -356,8 +370,25 @@ class TikTokManager:
             except queue.Full:
                 self.log_func("⚠️ Hàng đợi TTS vẫn đầy, bỏ âm thanh mới.")
 
+    def _safe_stop_client(self, client_instance):
+        if not client_instance:
+            return
+        try:
+            loop = getattr(client_instance, "_asyncio_loop", None)
+            ws = getattr(getattr(client_instance, "_ws", None), "ws", None)
+            if ws and loop and loop.is_running():
+                asyncio.run_coroutine_threadsafe(ws.close(), loop)
+            elif loop and loop.is_running():
+                loop.call_soon_threadsafe(loop.stop)
+        except Exception:
+            pass
+
+    def _enable_reading(self):
+        self.can_read = True
+        self.log_func("🎙️ Bắt đầu đọc tương tác mới...")
+
     # =========================================================
-    # 🔌 CONNECT (GIỮ NGUYÊN TOÀN BỘ LOGIC CỦA BẠN)
+    # 🔌 CONNECT
     # =========================================================
     def connect(self, username, app_ref):
         self.app_ref = app_ref
@@ -373,6 +404,11 @@ class TikTokManager:
         self.connected_username = username
         self.log_func(f"👤 Username: {username}")
 
+        # Dừng triệt để client cũ nếu còn hoạt động để tránh chạy song song nhiều luồng
+        if self.client:
+            self._safe_stop_client(self.client)
+            self.client = None
+
         try:
             self.client = TikTokLiveClient(unique_id=username)
             self.log_func("📡 Đã tạo TikTokLiveClient")
@@ -386,19 +422,28 @@ class TikTokManager:
         self.can_read = False
         self.is_running = True
         self.intentionally_disconnected = False
-        self.reconnect_attempts = 0
-
-        # Delay đọc comment cũ
-        threading.Timer(3.0, lambda: setattr(self, "can_read", True)).start()
 
         # =====================================================
         # ✅ CONNECT
         # =====================================================
         @self.client.on(ConnectEvent)
         async def on_connect(e):
+            self.reconnect_attempts = 0
+            self.is_reconnecting = False
+            self.connection_time = time.time()
             self.log_func("✅ CONNECT THÀNH CÔNG")
             if hasattr(app_ref, "on_live_connected"):
                 app_ref.on_live_connected(username)
+
+            # Chờ 3.0s sau khi ConnectEvent kích hoạt để TikTok xả hết toàn bộ batch comment cũ của phòng live
+            if hasattr(self, "_can_read_timer") and self._can_read_timer:
+                try:
+                    self._can_read_timer.cancel()
+                except Exception:
+                    pass
+            self._can_read_timer = threading.Timer(3.0, self._enable_reading)
+            self._can_read_timer.daemon = True
+            self._can_read_timer.start()
 
         # =====================================================
         # ❌ DISCONNECT
@@ -421,34 +466,70 @@ class TikTokManager:
             if not self.can_read:
                 return
 
-            uid, nickname = self._get_user_info(e)
-            key = f"{uid}:{getattr(e, 'comment', '')}"
-            if time.time() - self.recent_comments.get(key, 0) < 2:
+            raw_msg = getattr(e, 'comment', '') or getattr(e, 'content', '') or ''
+            if not raw_msg or not str(raw_msg).strip():
                 return
-            self.recent_comments[key] = time.time()
 
-            msg = getattr(e, 'comment', '')
-            if any(word.lower() in msg.lower() for word in self.blacklist):
+            # Kiểm tra thời gian tin nhắn: nếu là tin nhắn cũ sinh ra trước thời điểm kết nối live -> bỏ qua
+            common_data = getattr(e, 'common', None)
+            create_time = getattr(common_data, 'create_time', 0) if common_data else 0
+            if create_time:
+                msg_ts = create_time / 1000.0 if create_time > 1e11 else float(create_time)
+                if self.connection_time > 0 and msg_ts > 0 and msg_ts < (self.connection_time - 1.0):
+                    return
+
+            # Kiểm tra ID tin nhắn để chống lặp tuyệt đối khi mất mạng / nối lại
+            msg_id = (getattr(common_data, 'msg_id', None) if common_data else None) or getattr(e, 'id', None)
+            if msg_id:
+                if msg_id in self.seen_msg_ids:
+                    return
+                self.seen_msg_ids[msg_id] = time.time()
+                if len(self.seen_msg_ids) > 3000:
+                    self.seen_msg_ids.popitem(last=False)
+
+            uid, nickname = self._get_user_info(e)
+            if not nickname:
+                nickname = uid or "Ai đó"
+
+            # Blacklist check
+            if any(word.lower() in raw_msg.lower() for word in self.blacklist):
                 self.log_func(f"🛡️ Chặn cmt từ {nickname}")
                 return
 
+            # Xử lý viết tắt & emoji
+            msg = raw_msg
             for k, v in self.abbreviations.items():
                 msg = re.sub(rf"\b{k}\b", v, msg, flags=re.I)
             for k, v in self.emoji_map.items():
                 msg = msg.replace(k, v)
 
+            clean_msg = msg.strip()
+            # Bỏ qua nếu tin nhắn sau khi lọc không có chữ hoặc số nào để phát âm (tránh gTTS No text to speak)
+            if not re.search(r"[\w\dÀ-ỹ]", clean_msg):
+                self.log_func(f"💬 {nickname}: {raw_msg}")
+                return
+
+            # Chống lặp nội dung giống nhau từ cùng 1 người trong vòng 20s
+            dup_key = f"{uid or nickname}:{clean_msg}"
+            now = time.time()
+            if now - self.recent_comments.get(dup_key, 0) < 20:
+                return
+            self.recent_comments[dup_key] = now
+            if len(self.recent_comments) > 3000:
+                self.recent_comments.popitem(last=False)
+
             read_mode = getattr(app_ref, "read_mode_var", None)
             if read_mode and read_mode.get() == "Đọc cả Tên + Nội dung":
                 template_var = getattr(app_ref, "tpl_comment_var", None)
                 template = template_var.get() if template_var else "{name} nói: {comment}"
-                text = template.replace("{name}", nickname).replace("{comment}", msg)
+                text = template.replace("{name}", nickname).replace("{comment}", clean_msg)
             else:
-                text = msg
+                text = clean_msg
 
-            self.log_func(f"💬 {nickname}: {msg}")
+            self.log_func(f"💬 {nickname}: {clean_msg}")
             self.enqueue_tts(text, self.current_speed)
             if hasattr(app_ref, "register_live_event"):
-                app_ref.register_live_event("comment", {"nickname": nickname, "text": msg})
+                app_ref.register_live_event("comment", {"nickname": nickname, "text": clean_msg})
 
         # =====================================================
         # 🎁 GIFT
@@ -461,75 +542,81 @@ class TikTokManager:
                 return
             if not self.can_read:
                 return
-            if getattr(e.gift, "diamond_count", 0) <= 0:
+
+            gift_obj = getattr(e, "gift", None)
+            diamond_count = getattr(gift_obj, "diamond_count", 0) if gift_obj else 0
+            if diamond_count <= 0:
                 return
 
-            # Nếu quà thuộc dạng combo (streak) nhưng chưa kết thúc (repeat_end == 0) -> bỏ qua, chờ sự kiện chốt combo cuối cùng
-            gift_type = getattr(e.gift, "type", 0)
-            repeat_end = getattr(e.gift, "repeat_end", None)
-            if gift_type == 1 and repeat_end == 0:
-                return
+            # Kiểm tra thời gian quà (bỏ qua quà cũ trong phòng)
+            common_data = getattr(e, 'common', None)
+            create_time = getattr(common_data, 'create_time', 0) if common_data else 0
+            if create_time:
+                gift_ts = create_time / 1000.0 if create_time > 1e11 else float(create_time)
+                if self.connection_time > 0 and gift_ts > 0 and gift_ts < (self.connection_time - 1.0):
+                    return
 
             uid, nickname = self._get_user_info(e)
-            
-            original_gift_name = getattr(e.gift, 'name', '') or 'Quà'
-            
-            # --- Auto-add new gifts ---
+            if not nickname:
+                nickname = uid or "Ai đó"
+
+            original_gift_name = (getattr(gift_obj, 'name', '') if gift_obj else '') or 'Quà'
+
+            # Auto-add new gifts to map
             if original_gift_name not in self.gift_map and original_gift_name != 'Quà':
                 self.gift_map[original_gift_name] = original_gift_name
                 dm.save_json(dm.GIFT_FILE, self.gift_map)
 
             gift_name = self.gift_map.get(original_gift_name, original_gift_name)
-            
-            # Lấy số lượng quà thực tế từ TikTok (repeat_count hoặc gift count)
-            repeat_count = getattr(e.gift, "repeat_count", 0) or getattr(e, "repeat_count", 1) or 1
-            gift_key = f"{uid}:{original_gift_name}"
 
-            # --- Buffer & Aggregate (Chống spam và gom combo) ---
-            if not hasattr(self, 'gift_buffer'):
-                self.gift_buffer = {}
+            repeat_count = getattr(e, "repeat_count", None) or (getattr(gift_obj, "repeat_count", None) if gift_obj else None) or 1
+            repeat_end = getattr(e, "repeat_end", 1)
+            is_streaking = getattr(e, "streaking", False)
 
-            if gift_key not in self.gift_buffer:
-                self.gift_buffer[gift_key] = {
-                    "count": repeat_count,
-                    "nickname": nickname,
-                    "gift_name": gift_name,
-                    "timer": None
-                }
-            else:
-                # Cập nhật lại count mới nhất nếu lớn hơn
-                self.gift_buffer[gift_key]["count"] = max(self.gift_buffer[gift_key]["count"], repeat_count)
+            gift_key = f"{uid or nickname}:{original_gift_name}"
 
-            # Hủy timer cũ nếu có
-            if self.gift_buffer[gift_key]["timer"]:
-                self.gift_buffer[gift_key]["timer"].cancel()
+            # Quà đang trong chuỗi combo và chưa kết thúc (streaking == True hoặc repeat_end == 0)
+            if is_streaking or repeat_end == 0:
+                if gift_key not in self.gift_buffer:
+                    self.gift_buffer[gift_key] = {
+                        "count": repeat_count,
+                        "nickname": nickname,
+                        "gift_name": gift_name,
+                        "timer": None
+                    }
+                else:
+                    self.gift_buffer[gift_key]["count"] = max(self.gift_buffer[gift_key]["count"], repeat_count)
 
-            def process_gift(k):
-                data = self.gift_buffer.pop(k, None)
-                if not data: return
-                
-                count = data["count"]
-                nick = data["nickname"]
-                gname = data["gift_name"]
-                
-                # Nếu tặng nhiều hơn 1 (combo), chèn số lượng vào trước tên quà
-                if count > 1:
-                    gname = f"{count} {gname}"
+                # Reset timer dự phòng nếu TikTok không gửi sự kiện kết thúc chuỗi
+                if self.gift_buffer[gift_key]["timer"]:
+                    try:
+                        self.gift_buffer[gift_key]["timer"].cancel()
+                    except Exception:
+                        pass
 
-                template_var = getattr(app_ref, "tpl_gift_var", None)
-                template = template_var.get() if template_var else "{name} tặng {gift}"
-                text = template.replace("{name}", nick).replace("{gift}", gname)
+                self.gift_buffer[gift_key]["timer"] = threading.Timer(2.0, self._process_buffered_gift, args=[gift_key, app_ref])
+                self.gift_buffer[gift_key]["timer"].daemon = True
+                self.gift_buffer[gift_key]["timer"].start()
+                return
 
-                self.log_func(text)
-                self.enqueue_tts(text, self.current_speed)
-                
-                if hasattr(app_ref, "register_live_event"):
-                    app_ref.register_live_event("gift", {"nickname": nick, "gift": gname, "count": count})
+            # Sự kiện chốt chuỗi combo (repeat_end == 1) hoặc quà đơn không combo
+            count = repeat_count
+            if gift_key in self.gift_buffer:
+                buf = self.gift_buffer.pop(gift_key)
+                if buf.get("timer"):
+                    try:
+                        buf["timer"].cancel()
+                    except Exception:
+                        pass
+                count = max(buf["count"], repeat_count)
 
-            # Chờ 2.0 giây kể từ lần tặng cuối cùng trong combo rồi mới đọc
-            self.gift_buffer[gift_key]["timer"] = threading.Timer(2.0, process_gift, args=[gift_key])
-            self.gift_buffer[gift_key]["timer"].start()
-            # --------------------------------------------------
+            # Kiểm tra chống đọc lặp món quà này với cùng số lượng hoặc nhỏ hơn
+            last_processed = self.processed_gifts.get(gift_key, (0, 0))
+            if last_processed[0] >= count and (time.time() - last_processed[1] < 10):
+                return
+            self.processed_gifts[gift_key] = (count, time.time())
+
+            self._dispatch_gift(nickname, gift_name, count, app_ref)
 
         # =====================================================
         # 👋 JOIN
@@ -544,6 +631,9 @@ class TikTokManager:
                 return
 
             uid, nickname = self._get_user_info(e)
+            if not nickname:
+                return
+
             template_var = getattr(app_ref, "tpl_join_var", None)
             template = template_var.get() if template_var else "{name} đã vào phòng"
             text = template.replace("{name}", nickname)
@@ -565,6 +655,9 @@ class TikTokManager:
                 return
 
             uid, nickname = self._get_user_info(e)
+            if not nickname:
+                return
+
             uid_key = uid or getattr(e, 'user_id', None) or getattr(e, 'user_id_str', None) or nickname
             self.like_buffer[uid_key] = self.like_buffer.get(uid_key, 0) + getattr(e, "like_count", 1)
 
@@ -586,6 +679,33 @@ class TikTokManager:
         self._start_client_thread()
         return True
 
+    def _process_buffered_gift(self, gift_key, app_ref):
+        data = self.gift_buffer.pop(gift_key, None)
+        if not data:
+            return
+        count = data["count"]
+        nick = data["nickname"]
+        gname = data["gift_name"]
+
+        last_processed = self.processed_gifts.get(gift_key, (0, 0))
+        if last_processed[0] >= count and (time.time() - last_processed[1] < 10):
+            return
+        self.processed_gifts[gift_key] = (count, time.time())
+
+        self._dispatch_gift(nick, gname, count, app_ref)
+
+    def _dispatch_gift(self, nick, gname, count, app_ref):
+        display_gift = f"{count} {gname}" if count > 1 else gname
+        template_var = getattr(app_ref, "tpl_gift_var", None)
+        template = template_var.get() if template_var else "{name} tặng {gift}"
+        text = template.replace("{name}", nick).replace("{gift}", display_gift)
+
+        self.log_func(text)
+        self.enqueue_tts(text, self.current_speed)
+
+        if hasattr(app_ref, "register_live_event"):
+            app_ref.register_live_event("gift", {"nickname": nick, "gift": display_gift, "count": count})
+
     # =========================================================
     # 🚀 START THREAD
     # =========================================================
@@ -598,7 +718,8 @@ class TikTokManager:
     def _run_client(self):
         try:
             self.log_func("🚀 Đang chạy client...")
-            self.client.run()
+            # process_connect_events=False: BỎ QUA TOÀN BỘ BÌNH LUẬN VÀ QUÀ LỊCH SỬ KHI VỪA VÀO PHÒNG
+            self.client.run(process_connect_events=False)
         except Exception as e:
             self.log_func(f"❌ Lỗi client: {e}")
             if self.is_running and not self.intentionally_disconnected:
@@ -607,20 +728,31 @@ class TikTokManager:
     def _attempt_reconnect(self):
         if not self.is_running or self.intentionally_disconnected:
             return
+        if self.is_reconnecting:
+            return
+        self.is_reconnecting = True
+
         self.reconnect_attempts += 1
-        delay = min(20, 2 + self.reconnect_attempts * 2)
-        self.log_func(f"🔄 Tự nối lại sau {delay}s...")
-        
+        delay = min(15, 2 + self.reconnect_attempts * 2)
+        self.log_func(f"🔄 Mất kết nối. Tự nối lại sau {delay}s... (Lần {self.reconnect_attempts})")
+
+        if self.reconnect_timer:
+            try:
+                self.reconnect_timer.cancel()
+            except Exception:
+                pass
+
         def do_reconnect():
+            self.is_reconnecting = False
             if self.is_running and not self.intentionally_disconnected:
                 if self.client:
-                    try:
-                        self.client.stop()
-                    except Exception:
-                        pass
+                    self._safe_stop_client(self.client)
+                    self.client = None
                 self.connect(self.connected_username, getattr(self, "app_ref", None))
-                
-        threading.Timer(delay, do_reconnect).start()
+
+        self.reconnect_timer = threading.Timer(delay, do_reconnect)
+        self.reconnect_timer.daemon = True
+        self.reconnect_timer.start()
 
     # =========================================================
     # 🔌 DISCONNECT
@@ -629,12 +761,35 @@ class TikTokManager:
         self.intentionally_disconnected = True
         self.is_running = False
         self.can_read = False
-        self.stop_tts_now()
-        if self.client:
+        self.is_reconnecting = False
+
+        if self.reconnect_timer:
             try:
-                self.client.stop()
+                self.reconnect_timer.cancel()
             except Exception:
                 pass
+            self.reconnect_timer = None
+
+        if hasattr(self, "_can_read_timer") and self._can_read_timer:
+            try:
+                self._can_read_timer.cancel()
+            except Exception:
+                pass
+            self._can_read_timer = None
+
+        # Hủy các gift buffer timer còn sót
+        for item in self.gift_buffer.values():
+            if item.get("timer"):
+                try:
+                    item["timer"].cancel()
+                except Exception:
+                    pass
+        self.gift_buffer.clear()
+
+        self.stop_tts_now()
+        if self.client:
+            self._safe_stop_client(self.client)
+            self.client = None
             self.log_func("🔌 Đã ngắt kết nối.")
 
     # =========================================================
